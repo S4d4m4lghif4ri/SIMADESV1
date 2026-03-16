@@ -1,0 +1,464 @@
+<script>
+'use strict';
+
+// ── STATE ────────────────────────────────────────────────────
+const S = { token:null, user:null, page:null, cache:{}, pend:{} };
+const CM = 90000; // cache 90 detik
+
+const RLBL = {ADMIN:'Administrator',KEPALA_DESA:'Kepala Desa',SEKRETARIS_DESA:'Sekretaris Desa',KAUR:'KAUR',KASI:'KASI',BENDAHARA:'Bendahara'};
+const NAV  = [
+  {id:'dashboard',    lbl:'Dashboard',       ic:'fas fa-tachometer-alt', sc:'MENU'},
+  {id:'surat_keluar', lbl:'Surat Keluar',     ic:'fas fa-envelope',       sc:'SURAT'},
+  {id:'surat_masuk',  lbl:'Surat Masuk',      ic:'fas fa-inbox',          sc:'SURAT'},
+  {id:'disposisi',    lbl:'Disposisi',         ic:'fas fa-share-alt',      sc:'SURAT'},
+  {id:'tugas',        lbl:'Manajemen Tugas',  ic:'fas fa-tasks',          sc:'OPS'},
+  {id:'kegiatan',     lbl:'Kegiatan Desa',    ic:'fas fa-calendar-alt',   sc:'OPS'},
+  {id:'keuangan',     lbl:'Keuangan Desa',    ic:'fas fa-money-bill-wave',sc:'KEU'},
+  {id:'dokumen',      lbl:'Arsip Dokumen',    ic:'fas fa-archive',        sc:'DOK'},
+  {id:'laporan',      lbl:'Laporan',           ic:'fas fa-chart-bar',      sc:'SYS'},
+  {id:'pengaturan',   lbl:'Pengaturan',        ic:'fas fa-cog',            sc:'SYS'},
+];
+
+// ── CLIENT CACHE ─────────────────────────────────────────────
+function cg(k)    { const c=S.cache[k]; if(!c)return null; if(Date.now()-c.t>CM){delete S.cache[k];return null;} return c.d; }
+function cs(k,d)  { S.cache[k]={d,t:Date.now()}; }
+function cd(pfx)  { Object.keys(S.cache).forEach(k=>{ if(k.startsWith(pfx)) delete S.cache[k]; }); }
+const _tm={}; function debounce(k,fn,ms){clearTimeout(_tm[k]);_tm[k]=setTimeout(fn,ms||350);}
+
+// ── SAFE SESSION ─────────────────────────────────────────────
+const _m={};
+const SS={
+  get(k){try{return sessionStorage.getItem(k);}catch(e){return _m[k]||null;}},
+  set(k,v){try{sessionStorage.setItem(k,v);}catch(e){_m[k]=v;}},
+  clear(){try{sessionStorage.clear();}catch(e){Object.keys(_m).forEach(k=>delete _m[k]);}}
+};
+
+// ── FETCH WITH CACHE + DEDUP ──────────────────────────────────
+function fc(key, fn, args, cb, force) {
+  if (!force) { const c=cg(key); if(c){cb(c);return;} }
+  if (S.pend[key]) return;
+  S.pend[key]=1;
+  google.script.run
+    .withSuccessHandler(r=>{ delete S.pend[key]; if(r&&r.success!==false) cs(key,r); cb(r); })
+    .withFailureHandler(e=>{ delete S.pend[key]; toast('Error: '+e.message,'e'); })
+    [fn](...args);
+}
+
+// ── CHUNK RENDER ─────────────────────────────────────────────
+const CHUNK=50;
+function rRows(rows, fn, tbId) {
+  const tb=q('#'+tbId); if(!tb)return;
+  tb.innerHTML=rows.slice(0,CHUNK).map(fn).join('');
+  if(rows.length>CHUNK) rAF(()=>tb.insertAdjacentHTML('beforeend',rows.slice(CHUNK).map(fn).join('')));
+}
+function rAF(fn) { if(window.requestAnimationFrame) requestAnimationFrame(fn); else setTimeout(fn,16); }
+
+// ── INIT ─────────────────────────────────────────────────────
+function _init() {
+  const ep=q('#ln-p'); if(ep) ep.addEventListener('keypress',e=>{if(e.key==='Enter')doLogin();});
+  const pv=q('#prg-val'); if(pv) pv.addEventListener('input',function(){prg_upd(this.value);});
+  const td=new Date().toISOString().slice(0,10);
+  document.querySelectorAll('input[type=date]').forEach(el=>{if(!el.value)el.value=td;});
+  const t=SS.get('_t'), u=SS.get('_u');
+  if(t&&u){try{S.token=t;S.user=JSON.parse(u);boot();}catch(e){SS.clear();}}
+}
+if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',_init); else _init();
+function prg_upd(v){sT('prg-lbl',v);const b=q('#prg-bar');if(b)b.style.width=v+'%';}
+
+// ── AUTH ─────────────────────────────────────────────────────
+function doLogin() {
+  const em=val('ln-e'), pw=val('ln-p');
+  if(!em||!pw){showE('Email dan password harus diisi.');return;}
+  if(S.pend.login)return;
+  const btn=q('#ln-btn'); S.pend.login=1;
+  if(btn){btn.disabled=true;btn.innerHTML='<span class="sp sp2" style="display:inline-block"></span> Memuat…';}
+  hide('ln-err');
+  google.script.run
+    .withSuccessHandler(r=>{
+      delete S.pend.login;
+      if(btn){btn.disabled=false;btn.innerHTML='<i class="fas fa-sign-in-alt"></i> Masuk';}
+      if(r.success){S.token=r.token;S.user=r.user;SS.set('_t',r.token);SS.set('_u',JSON.stringify(r.user));boot();}
+      else showE(r.message||'Login gagal.');
+    })
+    .withFailureHandler(e=>{
+      delete S.pend.login;
+      if(btn){btn.disabled=false;btn.innerHTML='<i class="fas fa-sign-in-alt"></i> Masuk';}
+      showE('Koneksi gagal: '+e.message);
+    })
+    .login(em,pw);
+}
+function showE(m){const e=q('#ln-err');if(e){e.textContent=m;e.style.display='block';}}
+function togPwd(){const i=q('#ln-p'),e=q('#ln-eye');if(!i)return;i.type=i.type==='password'?'text':'password';if(e)e.className=i.type==='password'?'fas fa-eye':'fas fa-eye-slash';}
+function doLogout(){if(S.token)google.script.run.withSuccessHandler(()=>{}).logout(S.token);SS.clear();S.token=null;S.user=null;S.cache={};show('login-screen','flex');hide('app');const e=q('#ln-e'),p=q('#ln-p');if(e)e.value='';if(p)p.value='';}
+
+// ── BOOT ─────────────────────────────────────────────────────
+function boot() {
+  hide('login-screen'); show('app','block');
+  buildNav(); updateUI(); nav('dashboard');
+}
+
+function buildNav() {
+  const acc=S.user?.access||[];
+  let html='',sc='';
+  NAV.forEach(n=>{
+    if(!acc.includes(n.id))return;
+    if(n.sc!==sc){html+=`<div class="sbs">${n.sc}</div>`;sc=n.sc;}
+    html+=`<div class="sbm" id="nav-${n.id}" onclick="nav('${n.id}')"><i class="${n.ic}"></i>${n.lbl}</div>`;
+  });
+  const el=q('#sb-nav'); if(el) el.innerHTML=html;
+}
+
+function updateUI() {
+  const u=S.user; if(!u)return;
+  const ini=(u.nama||'U').split(' ').map(w=>w[0]).join('').slice(0,2).toUpperCase();
+  const rl=RLBL[u.role]||u.role;
+  ['sb-av','top-av','prf-av'].forEach(id=>sT(id,ini));
+  sT('sb-nm',u.nama);sT('sb-rl',rl);sT('top-nm',u.nama);sT('top-rl',rl);
+  sT('prf-nm',u.nama);sT('prf-jbt',u.jabatan);sT('prf-rl',rl);
+  const em=q('#prf-em');if(em)em.value=u.email||'';
+  if(u.role==='ADMIN'){const p=q('#usr-pn');if(p)p.style.display='block';}
+}
+
+// ── NAVIGATION ───────────────────────────────────────────────
+function nav(pg) {
+  if(!(S.user?.access||[]).includes(pg))return;
+  document.querySelectorAll('.pv').forEach(p=>p.classList.remove('active'));
+  document.querySelectorAll('.sbm').forEach(n=>n.classList.remove('active'));
+  const el=q('#pv-'+pg);if(el)el.classList.add('active');
+  const ni=q('#nav-'+pg);if(ni)ni.classList.add('active');
+  sT('top-ttl',NAV.find(n=>n.id===pg)?.lbl||pg);
+  S.page=pg;
+  if(window.innerWidth<769)closeSB();
+  ({dashboard:loadDSH,surat_keluar:loadSK,surat_masuk:loadSM,disposisi:loadDP,tugas:loadTGS,kegiatan:loadKGT,keuangan:loadKEU,dokumen:loadDOK,pengaturan:loadSET})[pg]?.();
+}
+function refreshPg(){cd('');if(S.page)nav(S.page);}
+
+function togSB(){
+  const sb=q('#sidebar'); if(!sb)return;
+  if(window.innerWidth<769){sb.classList.toggle('open');const b=q('#sbd');if(b)b.classList.toggle('show');}
+  else{sb.classList.toggle('hide');const tb=q('#topbar'),mn=q('#main'),h=sb.classList.contains('hide');if(tb)tb.classList.toggle('full',h);if(mn)mn.classList.toggle('full',h);}
+}
+function closeSB(){const sb=q('#sidebar'),b=q('#sbd');if(sb)sb.classList.remove('open');if(b)b.classList.remove('show');}
+
+// ── DASHBOARD ────────────────────────────────────────────────
+const CH={};
+function loadDSH(){
+  sT('dsh-nm',S.user?.nama?.split(' ')[0]||'Pengguna');
+  sT('dsh-dt',new Date().toLocaleDateString('id-ID',{weekday:'long',year:'numeric',month:'long',day:'numeric'}));
+  fc('dsh_'+(S.user?.role||''),'getDashboardData',[S.token],renderDSH);
+}
+function renderDSH(data){
+  if(!data?.success)return;
+  const c=data.cards||{};
+  const defs=[
+    {bg:'#dbeafe',ic:'#1d4ed8',fn:'fas fa-envelope-open',v:c.pending_surat??0,    l:'Surat Pending'},
+    {bg:'#d1fae5',ic:'#059669',fn:'fas fa-check-circle', v:c.approved_surat??0,   l:'Surat Disetujui'},
+    {bg:'#ede9fe',ic:'#7c3aed',fn:'fas fa-tasks',         v:c.active_tasks??0,     l:'Tugas Aktif'},
+    {bg:'#fef3c7',ic:'#d97706',fn:'fas fa-calendar-day',  v:c.today_activities??0, l:'Kegiatan Hari Ini'},
+    {bg:'#f1f5f9',ic:'#475569',fn:'fas fa-inbox',          v:c.total_surat_masuk??0,l:'Total Surat Masuk'},
+  ];
+  if(c.saldo_kas!==undefined) defs.push({bg:'#dcfce7',ic:'#15803d',fn:'fas fa-wallet',v:rp(c.saldo_kas),l:'Saldo Kas'});
+  const cr=q('#dsh-cards');
+  if(cr) cr.innerHTML=defs.map(d=>`<div class="sc"><div class="si" style="background:${d.bg};color:${d.ic}"><i class="${d.fn}"></i></div><div><div class="sv">${d.v}</div><div class="sl">${d.l}</div></div></div>`).join('');
+  rAF(()=>buildCharts(data.charts||{}));
+  if(data.recent_logs)renderLogs(data.recent_logs);
+}
+function buildCharts(ch){
+  if(!window.Chart){setTimeout(()=>buildCharts(ch),300);return;}
+  if(ch.letters_per_month){const m=Object.keys(ch.letters_per_month).sort().slice(-6);mkBar('ch-letters',m.map(fmtM),m.map(k=>ch.letters_per_month[k]),'#1d4ed8');}
+  if(ch.task_completion){const t=ch.task_completion;mkDo('ch-tasks',['Selesai','Pending','On Progress'],[t.selesai||0,t.pending||0,t.on_progress||0],['#10b981','#f59e0b','#1d4ed8']);}
+  if(ch.finance){const fp=q('#ch-fin-pn');if(fp)fp.style.display='block';const m=Object.keys(ch.finance).sort();mkLn('ch-fin',m.map(fmtM),m.map(k=>ch.finance[k].pemasukan),m.map(k=>ch.finance[k].pengeluaran));}
+}
+function renderLogs(logs){const p=q('#log-pn');if(p)p.style.display='block';const b=q('#log-bd');if(!b)return;b.innerHTML=logs.map(l=>`<div style="display:flex;align-items:center;gap:10px;padding:10px 16px;border-bottom:1px solid #f8fafc"><div style="width:32px;height:32px;border-radius:8px;background:var(--bg);display:flex;align-items:center;justify-content:center">${mIc(l.modul)}</div><div style="flex:1;min-width:0"><div style="font-size:13px;font-weight:600">${esc(l.nama_user||'')}</div><div style="font-size:11px;color:var(--tx3)">${esc(l.detail||l.aktivitas||'')}</div></div><div style="font-size:11px;color:var(--tx3);white-space:nowrap">${fmtDT(l.waktu)}</div></div>`).join('');}
+function mkBar(id,lb,da,co){const c=q('#'+id);if(!c)return;if(CH[id])CH[id].destroy();CH[id]=new Chart(c,{type:'bar',data:{labels:lb,datasets:[{data:da,backgroundColor:co+'33',borderColor:co,borderWidth:2,borderRadius:6,label:'Jumlah'}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{y:{beginAtZero:true,ticks:{precision:0}}}}});}
+function mkDo(id,lb,da,co){const c=q('#'+id);if(!c)return;if(CH[id])CH[id].destroy();CH[id]=new Chart(c,{type:'doughnut',data:{labels:lb,datasets:[{data:da,backgroundColor:co,borderWidth:0}]},options:{responsive:true,maintainAspectRatio:false,cutout:'65%',plugins:{legend:{position:'right',labels:{font:{size:11}}}}}});}
+function mkLn(id,lb,d1,d2){const c=q('#'+id);if(!c)return;if(CH[id])CH[id].destroy();CH[id]=new Chart(c,{type:'line',data:{labels:lb,datasets:[{label:'Pemasukan',data:d1,borderColor:'#10b981',backgroundColor:'#10b98120',tension:.4,fill:true},{label:'Pengeluaran',data:d2,borderColor:'#ef4444',backgroundColor:'#ef444420',tension:.4,fill:true}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{font:{size:11}}}},scales:{y:{beginAtZero:true,ticks:{callback:v=>'Rp '+fmtN(v)}}}}});}
+
+// ── SURAT KELUAR ─────────────────────────────────────────────
+function loadSK(f){
+  const st=val('f-sk'); setLd('tb-sk',8);
+  fc('sk_'+(st||'all'),'getSuratKeluar',[S.token,st?{status:st}:null],r=>{
+    if(!r?.success)return; if(!r.data.length){setEm('tb-sk',8,'Belum ada surat keluar');return;}
+    rRows(r.data,(s,i)=>{
+      const ca=S.user.role==='KEPALA_DESA'&&s.status==='PENDING',cd2=S.user.role==='ADMIN';
+      return `<tr><td style="color:var(--tx3)">${i+1}</td><td><span class="cid">${esc(s.nomor_surat)}</span></td><td style="max-width:180px"><div style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(s.perihal)}</div></td><td><span class="bdg2 bac">${esc(s.jenis_surat)}</span></td><td>${fmtD(s.tanggal)}</td><td>${esc(s.pembuat)}</td><td>${sb(s.status)}</td><td><div style="display:flex;gap:4px">${s.file_url?`<a href="${esc(s.file_url)}" target="_blank" class="bic"><i class="fas fa-eye"></i></a>`:''}${ca?`<button class="btn bsc bsm" onclick="apvSK('${s.surat_id}')"><i class="fas fa-check"></i></button>`:''}${ca?`<button class="btn bdg bsm" onclick="rjSK('${s.surat_id}')"><i class="fas fa-times"></i></button>`:''}${cd2?`<button class="btn bdg bsm" onclick="delSK('${s.surat_id}')"><i class="fas fa-trash"></i></button>`:''}</div></td></tr>`;
+    },'tb-sk');
+  },f);
+}
+function subSK(){
+  const d={nomor_surat:val('sk-no'),jenis_surat:val('sk-jn'),tanggal:val('sk-tg'),perihal:val('sk-ph'),catatan:val('sk-ct')};
+  if(!d.perihal)return toast('Perihal harus diisi.','e');
+  const f=q('#sk-fl').files[0];
+  const sv=ex=>{Object.assign(d,ex);call('createSuratKeluar',[S.token,d],()=>{toast('Surat dibuat!','s');closeM('m-sk');cd('sk_');cd('dsh_');loadSK(true);});};
+  f?upl(f,'SuratKeluar',fi=>sv({file_draft:fi.fileName,file_url:fi.fileUrl})):sv({});
+}
+function apvSK(id){if(!confirm('Setujui surat?'))return;call('approveSuratKeluar',[S.token,id,''],()=>{toast('Disetujui!','s');cd('sk_');cd('dsh_');loadSK(true);});}
+function rjSK(id){const a=prompt('Alasan pengembalian:');if(a===null)return;call('rejectSuratKeluar',[S.token,id,a],()=>{toast('Dikembalikan.','w');cd('sk_');loadSK(true);});}
+function delSK(id){if(!confirm('Hapus?'))return;call('deleteSuratKeluar',[S.token,id],()=>{toast('Dihapus.','s');cd('sk_');loadSK(true);});}
+
+// ── SURAT MASUK ───────────────────────────────────────────────
+function loadSM(f){
+  setLd('tb-sm',8);
+  fc('sm_all','getSuratMasuk',[S.token,null],r=>{
+    if(!r?.success)return; if(!r.data.length){setEm('tb-sm',8,'Belum ada surat masuk');return;}
+    rRows(r.data,(s,i)=>`<tr><td style="color:var(--tx3)">${i+1}</td><td><span class="cid">${esc(s.nomor_surat)}</span></td><td>${esc(s.asal_surat)}</td><td style="max-width:160px"><div style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(s.perihal)}</div></td><td>${fmtD(s.tanggal_surat)}</td><td>${fmtD(s.tanggal_terima)}</td><td>${sb(s.status)}</td><td><div style="display:flex;gap:4px">${s.file_url?`<a href="${esc(s.file_url)}" target="_blank" class="bic"><i class="fas fa-eye"></i></a>`:''}${['KEPALA_DESA','ADMIN','SEKRETARIS_DESA'].includes(S.user.role)?`<button class="btn bpr bsm" onclick="qDisp('${s.surat_masuk_id}','${esc(s.perihal)}')"><i class="fas fa-share-alt"></i></button>`:''}</div></td></tr>`,'tb-sm');
+  },f);
+}
+function subSM(){
+  const d={nomor_surat:val('sm-no'),asal_surat:val('sm-as'),tanggal_surat:val('sm-tg'),perihal:val('sm-ph')};
+  if(!d.nomor_surat||!d.asal_surat||!d.perihal)return toast('Nomor, asal, perihal wajib.','e');
+  const f=q('#sm-fl').files[0];
+  const sv=ex=>{Object.assign(d,ex);call('createSuratMasuk',[S.token,d],()=>{toast('Dicatat!','s');closeM('m-sm');cd('sm_');loadSM(true);});};
+  f?upl(f,'SuratMasuk',fi=>sv({file_surat:fi.fileName,file_url:fi.fileUrl})):sv({});
+}
+function qDisp(id,ph){nav('disposisi');setTimeout(()=>{prepDisp();const s=q('#dp-sm');if(s){const o=document.createElement('option');o.value=id;o.text='['+id+'] '+ph;o.selected=true;s.prepend(o);}},200);}
+
+// ── DISPOSISI ─────────────────────────────────────────────────
+function loadDP(f){
+  setLd('tb-dp',8);
+  fc('dp_'+(S.user?.role||''),'getDisposisi',[S.token],r=>{
+    if(!r?.success)return; if(!r.data.length){setEm('tb-dp',8,'Belum ada disposisi');return;}
+    rRows(r.data,(d,i)=>`<tr><td style="color:var(--tx3)">${i+1}</td><td><span class="cid" style="font-size:10px">${esc(d.surat_masuk_id||'–')}</span></td><td>${esc(d.dari)}</td><td><b>${esc(d.kepada)}</b></td><td style="max-width:160px;font-size:12px">${esc(d.instruksi)}</td><td>${fmtD(d.tanggal)}</td><td>${sb(d.status)}</td><td><div style="display:flex;gap:4px">${d.status==='PENDING'?`<button class="btn bsc bsm" onclick="updDP('${d.disposisi_id}','PROSES')"><i class="fas fa-play"></i></button>`:''}${d.status==='PROSES'?`<button class="btn bsc bsm" onclick="updDP('${d.disposisi_id}','SELESAI')"><i class="fas fa-check"></i></button>`:''}</div></td></tr>`,'tb-dp');
+  },f);
+}
+function prepDisp(){
+  const smc=cg('sm_all'),s=q('#dp-sm');
+  if(smc&&smc.data&&s) s.innerHTML='<option value="">– Pilih –</option>'+smc.data.map(r=>`<option value="${r.surat_masuk_id}">[${r.surat_masuk_id}] ${esc(r.perihal)}</option>`).join('');
+  else if(s) google.script.run.withSuccessHandler(r=>{if(r.success)s.innerHTML='<option value="">– Pilih –</option>'+r.data.map(x=>`<option value="${x.surat_masuk_id}">[${x.surat_masuk_id}] ${esc(x.perihal)}</option>`).join('');}).getSuratMasuk(S.token,null);
+  fillSel('#dp-kp');
+  openM('m-dp');
+}
+function subDP(){
+  const d={surat_masuk_id:val('dp-sm'),kepada:val('dp-kp'),instruksi:val('dp-in')};
+  if(!d.kepada||!d.instruksi)return toast('Penerima dan instruksi wajib.','e');
+  call('createDisposisi',[S.token,d],()=>{toast('Disposisi dibuat!','s');closeM('m-dp');cd('dp_');cd('sm_');loadDP(true);});
+}
+function updDP(id,st){call('updateDisposisiStatus',[S.token,id,st],()=>{cd('dp_');loadDP(true);});}
+
+// ── TUGAS ─────────────────────────────────────────────────────
+function loadTGS(f){
+  const c=q('#ta');if(c)c.innerHTML='<div style="padding:40px;text-align:center"><div class="sp" style="margin:0 auto"></div></div>';
+  fc('tgs_'+(S.user?.role||''),'getTugas',[S.token,null],r=>{
+    if(!r?.success)return;
+    const cc=['ADMIN','KEPALA_DESA','SEKRETARIS_DESA'].includes(S.user.role);
+    const b=q('#btn-tgs');if(b)b.style.display=cc?'flex':'none';
+    renderTGS(r.data,'ta');
+    renderTGS(r.data.filter(t=>t.penerima_tugas===S.user.nama||t.pemberi_tugas===S.user.nama),'tm');
+  },f);
+}
+function renderTGS(data,cid){
+  const c=q('#'+cid);if(!c)return;
+  if(!data.length){c.innerHTML='<div class="em" style="grid-column:1/-1"><i class="fas fa-tasks"></i><p>Tidak ada tugas</p></div>';return;}
+  const pc={URGENT:'#ef4444',TINGGI:'#f59e0b',NORMAL:'#10b981'};
+  c.innerHTML=data.map(t=>{
+    const cl=pc[t.prioritas]||'#94a3b8',lt=t.deadline&&new Date(t.deadline)<new Date()&&t.status!=='SELESAI';
+    const cd2=['ADMIN','KEPALA_DESA','SEKRETARIS_DESA'].includes(S.user.role);
+    return `<div class="tc" style="border-top-color:${cl}"><div class="tct"><span>${esc(t.nama_tugas)}</span>${sb(t.status)}</div><div class="tcd">${esc((t.deskripsi||'').slice(0,80))}${(t.deskripsi||'').length>80?'…':''}</div><div class="tcm"><div><i class="fas fa-user" style="color:var(--bl)"></i> ${esc(t.penerima_tugas)}</div><div style="color:${lt?'var(--rd)':'inherit'}"><i class="fas fa-calendar-times" style="color:${lt?'var(--rd)':'var(--am)'}"></i> ${fmtD(t.deadline)} ${lt?'<span class="bdg2 br2">Terlambat</span>':''}</div><div><i class="fas fa-flag" style="color:${cl}"></i> ${t.prioritas||'NORMAL'}</div></div><div class="tca"><button class="btn bpr bsm" onclick="openPRG('${t.tugas_id}')"><i class="fas fa-chart-line"></i> Progress</button>${t.file_url?`<a href="${t.file_url}" target="_blank" class="bic bsm"><i class="fas fa-paperclip"></i></a>`:''}${cd2?`<button class="btn bdg bsm" onclick="delTGS('${t.tugas_id}')"><i class="fas fa-trash"></i></button>`:''}</div></div>`;
+  }).join('');
+}
+function prepTgs(){fillSel('#tg-pr');openM('m-tgs');}
+function openPRG(id){const pi=q('#prg-id');if(pi)pi.value=id;const pv=q('#prg-val');if(pv)pv.value=0;prg_upd(0);const pk=q('#prg-kt');if(pk)pk.value='';openM('m-prg');}
+function subTGS(){
+  const d={nama_tugas:val('tg-nm'),deskripsi:val('tg-ds'),penerima_tugas:val('tg-pr'),prioritas:val('tg-pi'),tanggal_mulai:val('tg-ml'),deadline:val('tg-dl')};
+  if(!d.nama_tugas||!d.penerima_tugas)return toast('Nama dan penerima wajib.','e');
+  const f=q('#tg-fl').files[0];
+  const sv=ex=>{Object.assign(d,ex);call('createTugas',[S.token,d],()=>{toast('Tugas dibuat!','s');closeM('m-tgs');cd('tgs_');cd('dsh_');loadTGS(true);});};
+  f?upl(f,'DokumenTugas',fi=>sv({file_referensi:fi.fileName,file_url:fi.fileUrl})):sv({});
+}
+function subPRG(){
+  const pi=q('#prg-id'),pv=q('#prg-val');
+  const d={tugas_id:pi?pi.value:'',progress:pv?pv.value:0,keterangan:val('prg-kt')};
+  const f=q('#prg-fl').files[0];
+  const sv=ex=>{Object.assign(d,ex);call('addProgressTugas',[S.token,d],()=>{toast('Progress disimpan!','s');closeM('m-prg');cd('tgs_');cd('dsh_');loadTGS(true);});};
+  f?upl(f,'DokumenTugas',fi=>sv({file_hasil:fi.fileName,file_url:fi.fileUrl})):sv({});
+}
+function delTGS(id){if(!confirm('Hapus tugas?'))return;call('deleteTugas',[S.token,id],()=>{toast('Dihapus.','s');cd('tgs_');cd('dsh_');loadTGS(true);});}
+function swTab(btn,tid){document.querySelectorAll('.tbb').forEach(b=>b.classList.remove('active'));btn.classList.add('active');['ta','tm'].forEach(id=>{const e=q('#'+id);if(e)e.style.display=id===tid?'grid':'none';});}
+
+// ── KEGIATAN ──────────────────────────────────────────────────
+function loadKGT(f){
+  const m=val('f-kgt'); setLd('tb-kgt',7);
+  fc('kgt_'+(m||'all'),'getKegiatan',[S.token,m?{month:m}:null],r=>{
+    if(!r?.success)return; if(!r.data.length){setEm('tb-kgt',7,'Belum ada kegiatan');return;}
+    rRows(r.data,(k,i)=>`<tr><td style="color:var(--tx3)">${i+1}</td><td><b>${esc(k.nama_kegiatan)}</b></td><td>${fmtD(k.tanggal)}</td><td>${esc(k.waktu)}</td><td>${esc(k.lokasi)}</td><td>${esc(k.pelaksana)}</td><td><div style="display:flex;gap:4px">${k.file_url?`<a href="${k.file_url}" target="_blank" class="bic"><i class="fas fa-image"></i></a>`:''}${['ADMIN','KEPALA_DESA'].includes(S.user.role)?`<button class="btn bdg bsm" onclick="delKGT('${k.kegiatan_id}')"><i class="fas fa-trash"></i></button>`:''}</div></td></tr>`,'tb-kgt');
+  },f);
+}
+function subKGT(){
+  const d={nama_kegiatan:val('kg-nm'),tanggal:val('kg-tg'),waktu:val('kg-wk'),lokasi:val('kg-lo'),peserta:val('kg-ps'),catatan:val('kg-ct')};
+  if(!d.nama_kegiatan||!d.tanggal)return toast('Nama dan tanggal wajib.','e');
+  const f=q('#kg-fl').files[0];
+  const sv=ex=>{Object.assign(d,ex);call('createKegiatan',[S.token,d],()=>{toast('Kegiatan dicatat!','s');closeM('m-kgt');cd('kgt_');cd('dsh_');loadKGT(true);});};
+  f?upl(f,'DokumentasiKegiatan',fi=>sv({dokumentasi:fi.fileName,file_url:fi.fileUrl})):sv({});
+}
+function delKGT(id){if(!confirm('Hapus?'))return;call('deleteKegiatan',[S.token,id],()=>{toast('Dihapus.','s');cd('kgt_');cd('dsh_');loadKGT(true);});}
+
+// ── KEUANGAN ──────────────────────────────────────────────────
+function loadKEU(f){
+  const j=val('f-keu'); setLd('tb-keu',8);
+  fc('keu_'+(j||'all'),'getKeuangan',[S.token,j?{jenis:j}:null],r=>{
+    if(!r?.success)return;
+    if(r.summary){sT('fin-in',rp(r.summary.pemasukan));sT('fin-out',rp(r.summary.pengeluaran));sT('fin-sd',rp(r.summary.saldo));}
+    if(!r.data.length){setEm('tb-keu',8,'Belum ada transaksi');return;}
+    rRows(r.data,(t,i)=>`<tr><td style="color:var(--tx3)">${i+1}</td><td>${fmtD(t.tanggal)}</td><td><span class="bdg2 ${t.jenis==='PEMASUKAN'?'ba':'br2'}">${t.jenis}</span></td><td>${esc(t.kategori)}</td><td style="font-weight:700;color:${t.jenis==='PEMASUKAN'?'#15803d':'#dc2626'}">${rp(t.jumlah)}</td><td style="font-size:12px">${esc(t.keterangan)}</td><td>${esc(t.pencatat)}</td><td><div style="display:flex;gap:4px">${t.file_url?`<a href="${t.file_url}" target="_blank" class="bic"><i class="fas fa-receipt"></i></a>`:''}${['ADMIN','BENDAHARA'].includes(S.user.role)?`<button class="btn bdg bsm" onclick="delKEU('${t.transaksi_id}')"><i class="fas fa-trash"></i></button>`:''}</div></td></tr>`,'tb-keu');
+  },f);
+}
+function subKEU(){
+  const d={jenis:val('ku-jn'),tanggal:val('ku-tg'),kategori:val('ku-kt'),sumber_dana:val('ku-sr'),jumlah:val('ku-jl'),keterangan:val('ku-ket')};
+  if(!d.jumlah||isNaN(d.jumlah))return toast('Jumlah wajib diisi angka.','e');
+  const f=q('#ku-fl').files[0];
+  const sv=ex=>{Object.assign(d,ex);call('createTransaksi',[S.token,d],()=>{toast('Transaksi dicatat!','s');closeM('m-keu');cd('keu_');cd('dsh_');loadKEU(true);});};
+  f?upl(f,'BuktiKeuangan',fi=>sv({bukti:fi.fileName,file_url:fi.fileUrl})):sv({});
+}
+function delKEU(id){if(!confirm('Hapus?'))return;call('deleteTransaksi',[S.token,id],()=>{toast('Dihapus.','s');cd('keu_');cd('dsh_');loadKEU(true);});}
+
+// ── DOKUMEN ───────────────────────────────────────────────────
+function loadDOK(f){
+  const s=val('srch-dok'),k=val('f-dok');
+  const g=q('#dok-g');if(g)g.innerHTML='<div style="padding:40px;text-align:center"><div class="sp" style="margin:0 auto"></div></div>';
+  const fl={};if(k)fl.kategori=k;
+  fc('dok_'+(k||'all'),'getDokumen',[S.token,Object.keys(fl).length?fl:null],r=>{
+    if(!r?.success)return;
+    let da=r.data;
+    if(s){const qi=s.toLowerCase();da=da.filter(d=>(d.nama_dokumen||'').toLowerCase().includes(qi)||(d.tags||'').toLowerCase().includes(qi));}
+    if(!da.length){if(g)g.innerHTML='<div class="em" style="grid-column:1/-1"><i class="fas fa-folder-open"></i><p>Belum ada dokumen</p></div>';return;}
+    const ic={pdf:'fas fa-file-pdf',doc:'fas fa-file-word',docx:'fas fa-file-word',jpg:'fas fa-file-image',jpeg:'fas fa-file-image',png:'fas fa-file-image',xlsx:'fas fa-file-excel'};
+    const cl2={pdf:'#ef4444',doc:'#1d4ed8',docx:'#1d4ed8',jpg:'#10b981',jpeg:'#10b981',png:'#10b981',xlsx:'#15803d'};
+    const bld=d=>{const ex=((d.file||'').split('.').pop()||'').toLowerCase();return`<div class="dkc"><div style="display:flex;align-items:flex-start;gap:12px"><div class="dki" style="color:${cl2[ex]||'#64748b'}"><i class="${ic[ex]||'fas fa-file'}"></i></div><div style="flex:1;min-width:0"><div style="font-weight:700;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(d.nama_dokumen)}</div><div style="font-size:11px;color:var(--tx3);margin-top:2px">${esc(d.kategori)} · ${fmtD(d.tanggal)}</div><div style="font-size:11px;color:var(--tx3)">Oleh: ${esc(d.uploader)}</div></div></div><div style="display:flex;gap:6px;margin-top:10px">${d.file_url?`<a href="${d.file_url}" target="_blank" class="btn bpr bsm" style="flex:1;justify-content:center"><i class="fas fa-download"></i> Unduh</a>`:''} ${S.user.role==='ADMIN'?`<button class="btn bdg bsm" onclick="delDOK('${d.dokumen_id}')"><i class="fas fa-trash"></i></button>`:''}</div></div>`;};
+    if(g){g.innerHTML=da.slice(0,CHUNK).map(bld).join('');if(da.length>CHUNK)rAF(()=>g.insertAdjacentHTML('beforeend',da.slice(CHUNK).map(bld).join('')));}
+  },f);
+}
+function subDOK(){
+  const d={nama_dokumen:val('dk-nm'),kategori:val('dk-kt'),deskripsi:val('dk-ds'),tags:val('dk-tg')};
+  const f=q('#dk-fl').files[0];
+  if(!d.nama_dokumen||!f)return toast('Nama dan file wajib.','e');
+  upl(f,'Arsip',fi=>{d.file=fi.fileName;d.file_url=fi.fileUrl;call('createDokumen',[S.token,d],()=>{toast('Upload sukses!','s');closeM('m-dok');cd('dok_');loadDOK(true);});});
+}
+function delDOK(id){if(!confirm('Hapus?'))return;call('deleteDokumen',[S.token,id],()=>{toast('Dihapus.','s');cd('dok_');loadDOK(true);});}
+
+// ── PENGATURAN ────────────────────────────────────────────────
+function loadSET(){if(S.user?.role==='ADMIN')loadUSR();}
+function loadUSR(){
+  fc('usr_all','getUsers',[S.token],r=>{
+    if(!r?.success)return;
+    const tb=q('#tb-usr');
+    if(tb)tb.innerHTML=r.data.map(u=>`<tr><td><b>${esc(u.nama)}</b><br><span style="font-size:11px;color:var(--tx3)">${esc(u.jabatan)}</span></td><td><span class="bdg2 bac">${esc(u.role)}</span></td><td><span class="bdg2 ${u.status==='AKTIF'?'ba':'br2'}">${esc(u.status)}</span></td><td><button class="btn bdg bsm" onclick="delUSR('${u.user_id}')"><i class="fas fa-trash"></i></button></td></tr>`).join('');
+    fillSel('#tg-pr',r.data.filter(u=>u.role!=='ADMIN'));
+    fillSel('#dp-kp',r.data);
+  });
+}
+function fillSel(selId,data){
+  const el=q(selId);if(!el)return;
+  const src=data||cg('usr_all')?.data||[];
+  el.innerHTML='<option value="">– Pilih –</option>'+src.map(u=>`<option value="${esc(u.nama)}">${esc(u.nama)} (${esc(u.jabatan)})</option>`).join('');
+}
+function chPwd(){
+  const o=val('pw-o'),n=val('pw-n'),c=val('pw-c');
+  if(!o||!n)return toast('Semua field wajib.','e');
+  if(n!==c)return toast('Password baru tidak cocok.','e');
+  if(n.length<6)return toast('Min. 6 karakter.','e');
+  call('changePassword',[S.token,o,n],()=>{toast('Password diubah!','s');['pw-o','pw-n','pw-c'].forEach(id=>{const e=q('#'+id);if(e)e.value='';});});
+}
+function subUSR(){
+  const d={nama:val('us-nm'),jabatan:val('us-jb'),role:val('us-rl'),status:val('us-st'),email:val('us-em'),password:val('us-pw')};
+  if(!d.nama||!d.email||!d.password)return toast('Nama, email, password wajib.','e');
+  call('createUser',[S.token,d],()=>{toast('User dibuat!','s');closeM('m-usr');cd('usr_');loadUSR();});
+}
+function delUSR(id){if(!confirm('Hapus user?'))return;call('deleteUser',[S.token,id],()=>{toast('Dihapus.','s');cd('usr_');loadUSR();});}
+
+// ── LAPORAN ───────────────────────────────────────────────────
+let _rD=[],_rT='';
+const RPT={
+  surat_keluar:{t:'Laporan Surat Keluar',c:['nomor_surat','jenis_surat','perihal','tanggal','pembuat','status']},
+  surat_masuk :{t:'Laporan Surat Masuk', c:['nomor_surat','asal_surat','perihal','tanggal_surat','tanggal_terima','status']},
+  tugas       :{t:'Laporan Tugas',        c:['nama_tugas','pemberi_tugas','penerima_tugas','tanggal_mulai','deadline','prioritas','status']},
+  kegiatan    :{t:'Laporan Kegiatan',     c:['nama_kegiatan','tanggal','waktu','lokasi','pelaksana','peserta']},
+  keuangan    :{t:'Laporan Keuangan',     c:['tanggal','jenis','kategori','sumber_dana','jumlah','keterangan','pencatat']},
+};
+function loadRpt(type){
+  _rT=type;
+  google.script.run
+    .withSuccessHandler(r=>{if(!r.success){toast(r.message,'e');return;}_rD=r.data||[];renderRpt(type,_rD);})
+    .withFailureHandler(e=>toast('Error: '+e.message,'e'))
+    .getReportData(S.token,type,null);
+}
+function renderRpt(type,data){
+  const c=RPT[type];if(!c)return;
+  sT('rpt-ttl',c.t+` (${data.length} baris)`);
+  const rh=q('#rpt-hd');if(rh)rh.innerHTML=`<tr>${c.c.map(col=>`<th>${col.replace(/_/g,' ').toUpperCase()}</th>`).join('')}</tr>`;
+  const tb=q('#rpt-bd');if(!tb)return;
+  const bR=r=>`<tr>${c.c.map(col=>{let v=r[col]??'';if(col==='jumlah')v=rp(v);if(col.startsWith('tanggal')||col==='deadline')v=fmtD(v);return`<td>${esc(String(v))}</td>`;}).join('')}</tr>`;
+  tb.innerHTML=data.slice(0,CHUNK).map(bR).join('');
+  if(data.length>CHUNK)rAF(()=>tb.insertAdjacentHTML('beforeend',data.slice(CHUNK,500).map(bR).join('')));
+  if(!data.length)tb.innerHTML=`<tr><td colspan="${c.c.length}" class="em">Tidak ada data</td></tr>`;
+  const rp2=q('#rpt-pn');if(rp2)rp2.style.display='block';
+}
+function expCSV(){
+  if(!_rD.length)return; const c=RPT[_rT];
+  const rows=[c.c.join(','),..._rD.map(r=>c.c.map(col=>`"${(r[col]??'').toString().replace(/"/g,'""')}"`).join(','))];
+  const a=document.createElement('a');a.href=URL.createObjectURL(new Blob(['\ufeff'+rows.join('\n')],{type:'text/csv;charset=utf-8;'}));a.download=`SIMADES_${_rT}_${new Date().toISOString().slice(0,10)}.csv`;a.click();
+}
+function expPrint(){
+  const c=RPT[_rT];const w=window.open('','_blank');
+  w.document.write(`<html><head><title>${c?.t}</title><style>body{font-family:sans-serif;font-size:12px}table{border-collapse:collapse;width:100%}th,td{border:1px solid #ddd;padding:6px 8px}th{background:#1d4ed8;color:#fff}</style></head><body><h2 style="color:#1d4ed8">${c?.t}</h2><p>${new Date().toLocaleString('id-ID')}</p><table><thead><tr>${(c?.c||[]).map(col=>`<th>${col.replace(/_/g,' ').toUpperCase()}</th>`).join('')}</tr></thead><tbody>${_rD.map(r=>`<tr>${(c?.c||[]).map(col=>`<td>${esc(String(r[col]??''))}</td>`).join('')}</tr>`).join('')}</tbody></table></body></html>`);
+  w.document.close();w.print();
+}
+
+// ── FILE UPLOAD ───────────────────────────────────────────────
+function upl(file,folder,cb){
+  if(file.size>10*1024*1024)return toast('File maks. 10MB.','e');
+  const ov=q('#uov');if(ov)ov.classList.add('show');sT('uov-msg','Mengupload '+file.name+'…');
+  const rd=new FileReader();
+  rd.onload=e=>{
+    const b64=e.target.result.split(',')[1];
+    google.script.run
+      .withSuccessHandler(r=>{if(ov)ov.classList.remove('show');r.success?cb(r):toast('Upload gagal: '+r.message,'e');})
+      .withFailureHandler(er=>{if(ov)ov.classList.remove('show');toast('Upload gagal: '+er.message,'e');})
+      .uploadFile(S.token,b64,file.name,file.type,folder);
+  };
+  rd.readAsDataURL(file);
+}
+
+// ── GENERIC CALL ──────────────────────────────────────────────
+function call(fn,args,ok){
+  google.script.run
+    .withSuccessHandler(r=>{if(r&&r.success)ok(r);else toast((r&&r.message)||'Operasi gagal.','e');})
+    .withFailureHandler(e=>toast('Error: '+e.message,'e'))
+    [fn](...args);
+}
+
+// ── MODAL ─────────────────────────────────────────────────────
+function openM(id){const e=q('#'+id);if(e){e.classList.add('open');document.body.style.overflow='hidden';}}
+function closeM(id){const e=q('#'+id);if(e){e.classList.remove('open');document.body.style.overflow='';}}
+function bgCl(ev,ov){if(ev.target===ov)closeM(ov.id);}
+
+// ── TOAST ─────────────────────────────────────────────────────
+function toast(msg,type){
+  const tc=q('#toasts');if(!tc)return;
+  const ic={s:'fa-check-circle',e:'fa-exclamation-circle',w:'fa-exclamation-triangle'};
+  const t=document.createElement('div');t.className='ts ts-'+(type==='s'?'s':type==='e'?'e':'w');
+  t.innerHTML=`<i class="fas ${ic[type]||'fa-info-circle'}"></i>${esc(msg)}`;
+  tc.appendChild(t);setTimeout(()=>t.remove(),4000);
+}
+
+// ── TABLE HELPERS ─────────────────────────────────────────────
+function setLd(id,cols){const tb=q('#'+id);if(tb)tb.innerHTML=`<tr><td colspan="${cols}" style="text-align:center;padding:28px;color:var(--tx3)"><div class="sp" style="margin:0 auto 8px"></div>Memuat…</td></tr>`;}
+function setEm(id,cols,msg){const tb=q('#'+id);if(tb)tb.innerHTML=`<tr><td colspan="${cols}" class="em"><i class="fas fa-inbox"></i><p>${msg}</p></td></tr>`;}
+
+// ── DOM HELPERS ───────────────────────────────────────────────
+function q(s){return document.querySelector(s);}
+function val(id){const e=q('#'+id);return e?e.value.trim():'';}
+function sT(id,v){const e=q('#'+id);if(e)e.textContent=v;}
+function show(id,d){const e=q('#'+id);if(e)e.style.display=d||'block';}
+function hide(id){const e=q('#'+id);if(e)e.style.display='none';}
+
+// ── FORMAT ────────────────────────────────────────────────────
+function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#039;');}
+function fmtD(d){if(!d||d==='')return'–';try{return new Date(d).toLocaleDateString('id-ID',{day:'2-digit',month:'short',year:'numeric'});}catch{return String(d);}}
+function fmtDT(d){if(!d)return'–';try{return new Date(d).toLocaleString('id-ID',{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'});}catch{return String(d);}}
+function fmtM(m){if(!m)return m;try{const[y,mo]=m.split('-');return new Date(y,mo-1).toLocaleDateString('id-ID',{month:'short',year:'2-digit'});}catch{return m;}}
+function fmtN(n){return Math.round(n).toLocaleString('id-ID');}
+function rp(n){const v=parseFloat(n)||0;if(Math.abs(v)>=1e9)return'Rp '+(v/1e9).toFixed(1)+'M';if(Math.abs(v)>=1e6)return'Rp '+(v/1e6).toFixed(1)+'jt';return'Rp '+fmtN(v);}
+const SM={PENDING:['bp','Pending'],APPROVED:['ba','Disetujui'],REVISI:['br2','Revisi'],DITERIMA:['bac','Diterima'],DISPOSISI:['bpg','Disposisi'],ON_PROGRESS:['bpg','On Progress'],SELESAI:['bse','Selesai'],AKTIF:['bac','Aktif'],PROSES:['bpg','Proses']};
+function sb(s){const[cl,lb]=SM[s]||['bgr',s||'–'];return`<span class="bdg2 ${cl}">${lb}</span>`;}
+function mIc(m){return{AUTH:'🔐',SURAT_KELUAR:'📤',SURAT_MASUK:'📥',DISPOSISI:'↗️',TUGAS:'📋',KEGIATAN:'📅',KEUANGAN:'💰',ARSIP:'📁',PENGATURAN:'⚙️',FILE:'📎'}[m]||'📝';}
+</script>
